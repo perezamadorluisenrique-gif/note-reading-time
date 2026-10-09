@@ -12,6 +12,7 @@ import {
   readingSeconds,
 } from './src/reading.ts';
 import type { Counts, DurationStyle, LegacySettings, ReadingOptions } from './src/reading.ts';
+import { fillTimeLeft, scrollLine, timeLeft } from './src/progress.ts';
 
 interface NoteReadingTimeSettings extends ReadingOptions {
   showStatusBar: boolean;
@@ -19,6 +20,14 @@ interface NoteReadingTimeSettings extends ReadingOptions {
   /** `{time}` stands for the duration. */
   template: string;
   selectionTemplate: string;
+  /** Show the time left from the scroll position while reading. */
+  showTimeLeft: boolean;
+  /** The same in the editor (Live Preview and Source mode). */
+  showTimeLeftEditor: boolean;
+  /** `{time}` and `{percent}`. */
+  timeLeftTemplate: string;
+  /** A thin bar at the top of the note that fills as you read. */
+  showProgressBar: boolean;
   /** The note property the "save to properties" commands write, in minutes. */
   propertyName: string;
   /** Set once the settings of Reading Time have been offered. */
@@ -31,6 +40,10 @@ const DEFAULT_SETTINGS: NoteReadingTimeSettings = {
   durationStyle: 'short',
   template: '{time} read',
   selectionTemplate: '{time} (selection)',
+  showTimeLeft: true,
+  showTimeLeftEditor: false,
+  timeLeftTemplate: '{time} left · {percent}%',
+  showProgressBar: false,
   propertyName: 'reading-time',
   legacyChecked: false,
 };
@@ -57,6 +70,10 @@ const TEXT = {
   durationStyle: { name: 'Time format', desc: 'How the duration is written.' },
   template: { name: 'Status bar text', desc: 'Use {time} for the duration, for example "{time} read" or "Reading: {time}".' },
   selectionTemplate: { name: 'Text for a selection', desc: 'Shown instead when you select text. Use {time} for the duration.' },
+  showTimeLeft: { name: 'Show time left while reading', desc: 'In Reading view, once you scroll down, the status bar shows the time left from where you are.' },
+  showTimeLeftEditor: { name: 'Show time left in the editor', desc: 'The same in Live Preview and Source mode. Off by default.' },
+  timeLeftTemplate: { name: 'Time left text', desc: 'Use {time} for the time left and {percent} for how much you have read, for example "{time} left · {percent}%".' },
+  showProgressBar: { name: 'Show a progress bar', desc: 'A thin bar at the top of the note that fills as you read. Follows the two options above.' },
   propertyName: {
     name: 'Property name',
     desc: 'The note property that the "save to properties" commands fill in with the minutes, so you can sort or query notes by it.',
@@ -72,6 +89,9 @@ export default class NoteReadingTimePlugin extends Plugin {
 
   private scheduleUpdate = debounce(() => this.update(), 400, true);
   private scheduleSelection = debounce(() => this.update(), 120, true);
+  /** Scrolling fires constantly: run at most every 150 ms, and once more when it stops. */
+  private scheduleScroll = debounce(() => this.update(), 150, false);
+  private totalCache: { source: string; includeCode: boolean; counts: Counts } | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -109,6 +129,8 @@ export default class NoteReadingTimePlugin extends Plugin {
       if (file === this.app.workspace.getActiveFile()) this.scheduleUpdate();
     }));
     this.registerDomEvent(document, 'selectionchange', () => this.scheduleSelection());
+    this.listenToScroll(activeDocument);
+    this.registerEvent(this.app.workspace.on('window-open', (_win, win) => this.listenToScroll(win.document)));
 
     this.app.workspace.onLayoutReady(() => {
       this.applyStatusBar();
@@ -119,6 +141,60 @@ export default class NoteReadingTimePlugin extends Plugin {
 
   onunload() {
     this.statusEl?.remove();
+    this.removeBars(null);
+  }
+
+  /** Scroll does not bubble, so listen while capturing; one listener per window. */
+  private listenToScroll(doc: Document) {
+    this.registerDomEvent(
+      doc,
+      'scroll',
+      (evt) => {
+        if (!this.settings.showTimeLeft && !this.settings.showTimeLeftEditor) return;
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view && evt.target instanceof Node && view.contentEl.contains(evt.target)) this.scheduleScroll();
+      },
+      true,
+    );
+  }
+
+  private timeLeftOn(view: MarkdownView): boolean {
+    return view.getMode() === 'preview' ? this.settings.showTimeLeft : this.settings.showTimeLeftEditor;
+  }
+
+  /** The first visible source line, or null when the view cannot tell. */
+  private topLine(view: MarkdownView, source: string): number | null {
+    const mode = (view as unknown as { currentMode?: { getScroll?: () => unknown } }).currentMode;
+    let reported: unknown;
+    try {
+      reported = mode?.getScroll?.();
+    } catch {
+      reported = undefined;
+    }
+    const scroller = view.contentEl.querySelector<HTMLElement>(view.getMode() === 'preview' ? '.markdown-preview-view' : '.cm-scroller');
+    const range = scroller ? scroller.scrollHeight - scroller.clientHeight : 0;
+    return scrollLine(reported, scroller?.scrollTop ?? 0, range, source.split('\n').length);
+  }
+
+  /** The progress bar of a view, made on first use. `null` removes it. */
+  private setBar(view: MarkdownView, percent: number | null) {
+    const existing = view.contentEl.querySelector<HTMLProgressElement>(':scope > progress.note-reading-time-bar');
+    if (percent === null) {
+      existing?.remove();
+      view.contentEl.removeClass('note-reading-time-has-bar');
+      return;
+    }
+    const bar = existing ?? view.contentEl.createEl('progress', { cls: 'note-reading-time-bar' });
+    view.contentEl.addClass('note-reading-time-has-bar');
+    bar.max = 100;
+    bar.value = percent;
+  }
+
+  /** Remove the bar from every note, except the one in `keep`. */
+  private removeBars(keep: MarkdownView | null) {
+    for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+      if (leaf.view instanceof MarkdownView && leaf.view !== keep) this.setBar(leaf.view, null);
+    }
   }
 
   async loadSettings() {
@@ -152,11 +228,22 @@ export default class NoteReadingTimePlugin extends Plugin {
     return selection.toString();
   }
 
-  private measure(view: MarkdownView): { counts: Counts; seconds: number; selection: boolean } {
+  private measure(view: MarkdownView): { counts: Counts; seconds: number; selection: boolean; source: string } {
     const selected = this.selectedText(view);
     const selection = selected.trim().length > 0;
-    const counts = countText(selection ? selected : view.getViewData(), this.settings.includeCode);
-    return { counts, seconds: readingSeconds(counts, this.settings), selection };
+    const source = view.getViewData();
+    const counts = selection ? countText(selected, this.settings.includeCode) : this.countTotal(source);
+    return { counts, seconds: readingSeconds(counts, this.settings), selection, source };
+  }
+
+  /** The whole note counted, kept while the text and the code setting stay the same (scrolling asks often). */
+  private countTotal(source: string): Counts {
+    const includeCode = this.settings.includeCode;
+    const c = this.totalCache;
+    if (c && c.includeCode === includeCode && c.source === source) return c.counts;
+    const counts = countText(source, includeCode);
+    this.totalCache = { source, includeCode, counts };
+    return counts;
   }
 
   update() {
@@ -166,11 +253,34 @@ export default class NoteReadingTimePlugin extends Plugin {
       if (this.app.workspace.getLeavesOfType('markdown').length === 0) this.clear();
       return;
     }
-    this.current = this.measure(view);
+    const measured = this.measure(view);
+    this.current = measured;
+
+    // How far down the note the reader is, when that is shown.
+    let left: ReturnType<typeof timeLeft> | null = null;
+    let barPercent: number | null = null;
+    if (!measured.selection || this.settings.showProgressBar) {
+      const line = this.timeLeftOn(view) ? this.topLine(view, measured.source) : null;
+      if (line !== null) {
+        const t = timeLeft(measured.source, line, this.settings, this.countTotal(measured.source));
+        if (this.settings.showProgressBar) barPercent = line < 1 ? 0 : t.percent;
+        if (line >= 1 && !measured.selection) left = t;
+      }
+    }
+    this.removeBars(barPercent === null ? null : view);
+    if (barPercent !== null) this.setBar(view, barPercent);
+    else this.setBar(view, null);
+
     if (!this.statusEl) return;
-    const time = formatDuration(this.current.seconds, this.settings.durationStyle);
-    this.statusEl.setText(fillTemplate(this.current.selection ? this.settings.selectionTemplate : this.settings.template, time));
-    setTooltip(this.statusEl, this.describe(this.current.counts, this.current.seconds, this.current.selection), { placement: 'top' });
+    const style = this.settings.durationStyle;
+    if (left) {
+      this.statusEl.setText(fillTimeLeft(this.settings.timeLeftTemplate, formatDuration(left.remainingSeconds, style), left.percent));
+      setTooltip(this.statusEl, this.describe(left.remaining, left.remainingSeconds, 'Left: '), { placement: 'top' });
+      return;
+    }
+    const time = formatDuration(measured.seconds, style);
+    this.statusEl.setText(fillTemplate(measured.selection ? this.settings.selectionTemplate : this.settings.template, time));
+    setTooltip(this.statusEl, this.describe(measured.counts, measured.seconds, measured.selection ? 'Selection: ' : ''), { placement: 'top' });
   }
 
   private clear() {
@@ -178,13 +288,13 @@ export default class NoteReadingTimePlugin extends Plugin {
     this.statusEl?.setText('');
   }
 
-  private describe(counts: Counts, seconds: number, selection: boolean): string {
+  private describe(counts: Counts, seconds: number, prefix: string): string {
     const parts: string[] = [];
     if (counts.words > 0 || counts.cjk === 0) parts.push(`${formatNumber(counts.words)} words`);
     if (counts.cjk > 0) parts.push(`${formatNumber(counts.cjk)} characters`);
     if (counts.images > 0) parts.push(`${formatNumber(counts.images)} ${counts.images === 1 ? 'image' : 'images'}`);
     const speed = counts.cjk > 0 && counts.words === 0 ? `${this.settings.cjkPerMinute} characters per minute` : `${this.settings.wpm} words per minute`;
-    return `${selection ? 'Selection: ' : ''}${parts.join(' · ')} · ${formatDuration(seconds, 'precise')} at ${speed}`;
+    return `${prefix}${parts.join(' · ')} · ${formatDuration(seconds, 'precise')} at ${speed}`;
   }
 
   showDetails() {
@@ -194,7 +304,7 @@ export default class NoteReadingTimePlugin extends Plugin {
       return;
     }
     const { counts, seconds, selection } = this.measure(view);
-    new Notice(this.describe(counts, seconds, selection), 6000);
+    new Notice(this.describe(counts, seconds, selection ? 'Selection: ' : ''), 6000);
   }
 
   /** Write the minutes to the note's properties. Returns whether the file changed. */
@@ -332,6 +442,16 @@ class NoteReadingTimeSettingTab extends PluginSettingTab {
       },
       {
         type: 'group',
+        heading: 'Time left',
+        items: [
+          { ...TEXT.showTimeLeft, control: { type: 'toggle', key: 'showTimeLeft', defaultValue: d.showTimeLeft } },
+          { ...TEXT.showTimeLeftEditor, control: { type: 'toggle', key: 'showTimeLeftEditor', defaultValue: d.showTimeLeftEditor } },
+          { ...TEXT.timeLeftTemplate, control: { type: 'text', key: 'timeLeftTemplate', placeholder: '{time} left · {percent}%', defaultValue: d.timeLeftTemplate } },
+          { ...TEXT.showProgressBar, control: { type: 'toggle', key: 'showProgressBar', defaultValue: d.showProgressBar } },
+        ],
+      },
+      {
+        type: 'group',
         heading: 'Properties',
         items: [{ ...TEXT.propertyName, control: { type: 'text', key: 'propertyName', placeholder: 'reading-time', defaultValue: d.propertyName } }],
       },
@@ -393,6 +513,11 @@ class NoteReadingTimeSettingTab extends PluginSettingTab {
       );
     this.text('template', TEXT.template);
     this.text('selectionTemplate', TEXT.selectionTemplate);
+    new Setting(containerEl).setName('Time left').setHeading();
+    this.toggle('showTimeLeft', TEXT.showTimeLeft);
+    this.toggle('showTimeLeftEditor', TEXT.showTimeLeftEditor);
+    this.text('timeLeftTemplate', TEXT.timeLeftTemplate);
+    this.toggle('showProgressBar', TEXT.showProgressBar);
     new Setting(containerEl).setName('Properties').setHeading();
     this.text('propertyName', TEXT.propertyName);
     new Setting(containerEl)
