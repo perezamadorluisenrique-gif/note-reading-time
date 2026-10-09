@@ -22,6 +22,22 @@ The estimate is for the text a person reads, not for everything in the file:
 - Images can add time: set **Seconds per image** if you want them to.
 - Code blocks can be counted from the settings.
 
+## Time left as you read
+
+Scroll down a note in Reading view and the status bar switches from the total
+to what is left from where you are, for example `4 min left · 62%`. At the
+top of the note it shows the total, as before. The time left uses the same
+rules and reading speed as the total, and the percent is the share of the
+reading time already behind you. A selection still shows its own time.
+
+- **Show time left while reading** is on by default for Reading view.
+- **Show time left in the editor** does the same in Live Preview and Source
+  mode. It is off by default.
+- **Time left text** sets the wording: `{time}` is the time left and
+  `{percent}` how much you have read.
+- **Show a progress bar** adds a thin bar at the top of the note that fills as
+  you read. It is off by default.
+
 ## Settings
 
 | Setting | Default | What it does |
@@ -34,6 +50,10 @@ The estimate is for the text a person reads, not for everything in the file:
 | Time format | `5 min` | `5 min` or `1 h 5 min`, `5 min 30 s`, or `5:30`. |
 | Status bar text | `{time} read` | `{time}` is the duration: `Reading: {time}` works too. |
 | Text for a selection | `{time} (selection)` | Shown instead while text is selected. |
+| Show time left while reading | on | Reading view: the status bar shows the time left once you scroll down. |
+| Show time left in the editor | off | The same in Live Preview and Source mode. |
+| Time left text | `{time} left · {percent}%` | `{time}` is the time left, `{percent}` how much you have read. |
+| Show a progress bar | off | A thin bar at the top of the note that fills as you read. |
 | Property name | `reading-time` | The note property the commands below fill in. |
 
 ## Commands
