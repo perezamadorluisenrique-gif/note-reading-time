@@ -13,6 +13,7 @@ import {
 } from './src/reading.ts';
 import type { Counts, DurationStyle, LegacySettings, ReadingOptions } from './src/reading.ts';
 import { fillTimeLeft, scrollLine, timeLeft } from './src/progress.ts';
+import { moreDefinitions, renderMore } from './src/more-link.ts';
 
 interface NoteReadingTimeSettings extends ReadingOptions {
   showStatusBar: boolean;
@@ -456,6 +457,7 @@ class NoteReadingTimeSettingTab extends PluginSettingTab {
         items: [{ ...TEXT.propertyName, control: { type: 'text', key: 'propertyName', placeholder: 'reading-time', defaultValue: d.propertyName } }],
       },
       { ...TEXT.legacy, action: () => void this.importLegacy() },
+      ...(moreDefinitions() as SettingDefinitionItem[]),
     ];
   }
 
@@ -490,6 +492,7 @@ class NoteReadingTimeSettingTab extends PluginSettingTab {
   display(): void {
     this.legacy = true;
     this.draw();
+    renderMore(this.containerEl, (el) => new Setting(el));
   }
 
   private draw(): void {
